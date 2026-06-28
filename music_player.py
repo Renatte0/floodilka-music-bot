@@ -69,7 +69,7 @@ def _build_ffmpeg_args(track: Track) -> list[str]:
     for k, v in track.http_headers.items():
         headers_str += f"{k}: {v}\r\n"
 
-    args = ["/opt/homebrew/bin/ffmpeg", "-reconnect", "1", "-reconnect_streamed", "1",
+    args = ["ffmpeg", "-reconnect", "1", "-reconnect_streamed", "1",
             "-reconnect_delay_max", "5"]
     if headers_str:
         args += ["-headers", headers_str]
