@@ -27,16 +27,24 @@ class Track:
 
 async def resolve_track(query: str, requested_by: str) -> Track:
     """Search YouTube (or resolve a direct URL) and return a Track."""
+    import os
     is_url = query.startswith("http")
     if not is_url:
-        query = f"scsearch1:{query}"
+        query = f"ytsearch1:{query}"
 
     ydl_opts = {
-        "format": "bestaudio/best",
+        "format": "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best",
         "quiet": True,
         "noplaylist": True,
         "no_warnings": True,
+        "extractor_args": {"youtube": {"player_client": ["tv_embedded"]}},
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (SMART-TV; Linux; Tizen 5.0) AppleWebKit/538.1 (KHTML, like Gecko) Version/5.0 TV Safari/538.1",
+        },
     }
+    cookies_path = "/root/cookies.txt"
+    if os.path.exists(cookies_path):
+        ydl_opts["cookiefile"] = cookies_path
 
     loop = asyncio.get_event_loop()
 
