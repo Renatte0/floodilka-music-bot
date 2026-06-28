@@ -35,7 +35,8 @@ async def resolve_track(query: str, requested_by: str) -> Track:
         "quiet": True,
         "noplaylist": True,
         "no_warnings": True,
-        "extractor_args": {"youtube": {"player_client": ["ios"]}},
+        "extractor_args": {"youtube": {"player_client": ["ios", "mweb"]}},
+        "format_sort": ["quality", "ext:m4a:mp4"],
     }
 
     loop = asyncio.get_event_loop()
