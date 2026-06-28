@@ -1,13 +1,24 @@
 import asyncio
 import logging
+import os
 import subprocess
 import time
 from dataclasses import dataclass, field
 
+import aiohttp
 import yt_dlp
 from livekit import rtc
 
 logger = logging.getLogger(__name__)
+
+# Public Invidious instances — tried in order until one responds
+_INVIDIOUS = [
+    "https://inv.tux.pizza",
+    "https://invidious.nerdvpn.de",
+    "https://y.com.sb",
+    "https://invidious.privacyredirect.com",
+    "https://invidious.slipfox.xyz",
+]
 
 SAMPLE_RATE = 48000
 NUM_CHANNELS = 2
@@ -25,22 +36,73 @@ class Track:
     http_headers: dict = field(default_factory=dict)
 
 
+async def _resolve_via_invidious(query: str, requested_by: str) -> Track | None:
+    """Search via a public Invidious instance to bypass YouTube bot detection."""
+    timeout = aiohttp.ClientTimeout(total=12)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for instance in _INVIDIOUS:
+            try:
+                # 1. Search
+                async with session.get(
+                    f"{instance}/api/v1/search",
+                    params={"q": query, "type": "video", "sort_by": "relevance"},
+                ) as resp:
+                    if resp.status != 200:
+                        continue
+                    results = await resp.json()
+                    if not results:
+                        continue
+                    video = results[0]
+                    video_id = video["videoId"]
+                    title = video.get("title", "Unknown")
+                    duration = video.get("lengthSeconds", 0)
+
+                # 2. Get formats
+                async with session.get(f"{instance}/api/v1/videos/{video_id}") as resp:
+                    if resp.status != 200:
+                        continue
+                    info = await resp.json()
+
+                audio_formats = [
+                    f for f in info.get("adaptiveFormats", [])
+                    if "audio" in f.get("type", "") and f.get("url")
+                ]
+                if not audio_formats:
+                    continue
+                audio_formats.sort(key=lambda f: int(f.get("bitrate", 0)), reverse=True)
+                stream_url = audio_formats[0]["url"]
+
+                logger.info("Invidious resolved %s via %s", title, instance)
+                return Track(
+                    title=title,
+                    stream_url=stream_url,
+                    webpage_url=f"https://www.youtube.com/watch?v={video_id}",
+                    duration=duration,
+                    requested_by=requested_by,
+                )
+            except Exception as exc:
+                logger.debug("Invidious %s failed: %s", instance, exc)
+                continue
+    return None
+
+
 async def resolve_track(query: str, requested_by: str) -> Track:
     """Search YouTube (or resolve a direct URL) and return a Track."""
-    import os
     is_url = query.startswith("http")
-    if not is_url:
-        query = f"ytsearch1:{query}"
 
+    # For text queries try Invidious first (no bot detection)
+    if not is_url:
+        track = await _resolve_via_invidious(query, requested_by)
+        if track:
+            return track
+        logger.warning("All Invidious instances failed, falling back to yt-dlp")
+
+    ydl_query = query if is_url else f"ytsearch1:{query}"
     ydl_opts = {
         "format": "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best",
         "quiet": True,
         "noplaylist": True,
         "no_warnings": True,
-        "extractor_args": {"youtube": {"player_client": ["tv_embedded"]}},
-        "http_headers": {
-            "User-Agent": "Mozilla/5.0 (SMART-TV; Linux; Tizen 5.0) AppleWebKit/538.1 (KHTML, like Gecko) Version/5.0 TV Safari/538.1",
-        },
     }
     cookies_path = "/root/cookies.txt"
     if os.path.exists(cookies_path):
@@ -50,7 +112,7 @@ async def resolve_track(query: str, requested_by: str) -> Track:
 
     def _extract() -> dict:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(query, download=False)
+            info = ydl.extract_info(ydl_query, download=False)
             if "entries" in info:
                 info = info["entries"][0]
             return info
