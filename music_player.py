@@ -35,7 +35,7 @@ async def resolve_track(query: str, requested_by: str) -> Track:
         "quiet": True,
         "noplaylist": True,
         "no_warnings": True,
-        "extractor_args": {"youtube": {"player_client": ["tv_embedded", "ios"]}},
+        "cookiefile": "/root/cookies.txt",
     }
 
     loop = asyncio.get_event_loop()
