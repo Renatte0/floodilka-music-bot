@@ -31,7 +31,7 @@ async def resolve_track(query: str, requested_by: str) -> Track:
         query = f"ytsearch1:{query}"
 
     ydl_opts = {
-        "format": "bestaudio/best",
+        "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
         "quiet": True,
         "noplaylist": True,
         "no_warnings": True,
