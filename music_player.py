@@ -27,15 +27,15 @@ class Track:
 
 async def resolve_track(query: str, requested_by: str) -> Track:
     """Search YouTube (or resolve a direct URL) and return a Track."""
-    if not query.startswith("http"):
-        query = f"ytsearch1:{query}"
+    is_url = query.startswith("http")
+    if not is_url:
+        query = f"scsearch1:{query}"
 
     ydl_opts = {
-        "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
+        "format": "bestaudio/best",
         "quiet": True,
         "noplaylist": True,
         "no_warnings": True,
-        "cookiefile": "/root/cookies.txt",
     }
 
     loop = asyncio.get_event_loop()
