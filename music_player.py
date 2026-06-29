@@ -5,20 +5,28 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 
-import aiohttp
 import yt_dlp
 from livekit import rtc
 
 logger = logging.getLogger(__name__)
 
-# Public Invidious instances — tried in order until one responds
-_INVIDIOUS = [
-    "https://inv.tux.pizza",
-    "https://invidious.nerdvpn.de",
-    "https://y.com.sb",
-    "https://invidious.privacyredirect.com",
-    "https://invidious.slipfox.xyz",
-]
+_ym_client = None
+
+
+def _get_ym_client():
+    global _ym_client
+    if _ym_client is not None:
+        return _ym_client
+    token = os.environ.get("YANDEX_MUSIC_TOKEN", "")
+    if not token:
+        return None
+    try:
+        import yandex_music
+        _ym_client = yandex_music.Client(token).init()
+        logger.info("Yandex Music client ready")
+    except Exception as e:
+        logger.error("Yandex Music init failed: %s", e)
+    return _ym_client
 
 SAMPLE_RATE = 48000
 NUM_CHANNELS = 2
@@ -36,83 +44,59 @@ class Track:
     http_headers: dict = field(default_factory=dict)
 
 
-async def _resolve_via_invidious(query: str, requested_by: str) -> Track | None:
-    """Search via a public Invidious instance to bypass YouTube bot detection."""
-    timeout = aiohttp.ClientTimeout(total=12)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        for instance in _INVIDIOUS:
-            try:
-                # 1. Search
-                async with session.get(
-                    f"{instance}/api/v1/search",
-                    params={"q": query, "type": "video", "sort_by": "relevance"},
-                ) as resp:
-                    if resp.status != 200:
-                        continue
-                    results = await resp.json()
-                    if not results:
-                        continue
-                    video = results[0]
-                    video_id = video["videoId"]
-                    title = video.get("title", "Unknown")
-                    duration = video.get("lengthSeconds", 0)
-
-                # 2. Get formats
-                async with session.get(f"{instance}/api/v1/videos/{video_id}") as resp:
-                    if resp.status != 200:
-                        continue
-                    info = await resp.json()
-
-                audio_formats = [
-                    f for f in info.get("adaptiveFormats", [])
-                    if "audio" in f.get("type", "") and f.get("url")
-                ]
-                if not audio_formats:
-                    continue
-                audio_formats.sort(key=lambda f: int(f.get("bitrate", 0)), reverse=True)
-                stream_url = audio_formats[0]["url"]
-
-                logger.info("Invidious resolved %s via %s", title, instance)
-                return Track(
-                    title=title,
-                    stream_url=stream_url,
-                    webpage_url=f"https://www.youtube.com/watch?v={video_id}",
-                    duration=duration,
-                    requested_by=requested_by,
-                )
-            except Exception as exc:
-                logger.debug("Invidious %s failed: %s", instance, exc)
-                continue
-    return None
-
-
 async def resolve_track(query: str, requested_by: str) -> Track:
-    """Search YouTube (or resolve a direct URL) and return a Track."""
+    """Search Yandex Music (or resolve a direct URL) and return a Track."""
     is_url = query.startswith("http")
 
-    # For text queries try Invidious first (no bot detection)
     if not is_url:
-        track = await _resolve_via_invidious(query, requested_by)
-        if track:
-            return track
-        logger.warning("All Invidious instances failed, falling back to yt-dlp")
+        loop = asyncio.get_event_loop()
 
-    ydl_query = query if is_url else f"ytsearch1:{query}"
+        def _ym_search():
+            client = _get_ym_client()
+            if not client:
+                return None
+            result = client.search(query, type_="track")
+            if not result or not result.tracks or not result.tracks.results:
+                return None
+            t = result.tracks.results[0]
+            infos = t.get_download_info(get_direct_links=True)
+            if not infos:
+                return None
+            infos.sort(key=lambda x: x.bitrate_in_kbps or 0, reverse=True)
+            url = infos[0].direct_link
+            if not url:
+                return None
+            artists = ", ".join(a.name for a in (t.artists or []))
+            title = f"{artists} - {t.title}" if artists else (t.title or "Unknown")
+            return Track(
+                title=title,
+                stream_url=url,
+                webpage_url=f"https://music.yandex.ru/track/{t.id}",
+                duration=(t.duration_ms or 0) // 1000,
+                requested_by=requested_by,
+            )
+
+        try:
+            track = await loop.run_in_executor(None, _ym_search)
+            if track:
+                return track
+        except Exception as e:
+            logger.error("Yandex Music search error: %s", e)
+
+        raise RuntimeError(f"Не удалось найти трек: {query}")
+
+    # Direct URL — fall back to yt-dlp
     ydl_opts = {
         "format": "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best",
         "quiet": True,
         "noplaylist": True,
         "no_warnings": True,
     }
-    cookies_path = "/root/cookies.txt"
-    if os.path.exists(cookies_path):
-        ydl_opts["cookiefile"] = cookies_path
-
     loop = asyncio.get_event_loop()
 
     def _extract() -> dict:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(ydl_query, download=False)
+            info = ydl.extract_info(query, download=False)
             if "entries" in info:
                 info = info["entries"][0]
             return info
