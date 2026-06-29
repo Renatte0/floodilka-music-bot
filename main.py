@@ -2,6 +2,7 @@ import asyncio
 import os
 import sys
 import logging
+import time
 
 # Переходим в папку бота чтобы .env и импорты всегда находились
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
@@ -18,8 +19,14 @@ if not TOKEN:
 
 bot = FloodilkaBot(TOKEN)
 
+IDLE_TIMEOUT = 30 * 60  # 30 минут в секундах
+
 # per-guild music players
 _players: dict[str, MusicPlayer] = {}
+# время последней активности (команды) по guild_id
+_last_activity: dict[str, float] = {}
+# channel_id для отправки сообщения об авто-выходе
+_last_text_channel: dict[str, str] = {}
 
 
 async def get_or_create_player(guild_id: str, channel_id: str) -> MusicPlayer | None:
@@ -62,6 +69,37 @@ async def disconnect_player(guild_id: str) -> None:
     await bot.leave_voice(guild_id)
 
 
+async def _idle_watcher() -> None:
+    """Раз в минуту проверяет, не простаивает ли бот в канале дольше 30 минут."""
+    while True:
+        await asyncio.sleep(60)
+        now = time.monotonic()
+        for guild_id in list(_players.keys()):
+            player = _players.get(guild_id)
+            if not player:
+                continue
+            # Если сейчас играет — обновляем таймер активности
+            if player.is_playing:
+                _last_activity[guild_id] = now
+                continue
+            last = _last_activity.get(guild_id, now)
+            if now - last >= IDLE_TIMEOUT:
+                logger.info("Авто-выход из канала (таймаут бездействия) guild=%s", guild_id)
+                ch = _last_text_channel.get(guild_id)
+                try:
+                    await player.stop()
+                    await disconnect_player(guild_id)
+                except Exception:
+                    pass
+                _last_activity.pop(guild_id, None)
+                _last_text_channel.pop(guild_id, None)
+                if ch:
+                    try:
+                        await bot.send_message(ch, "Вышел из голосового канала из-за бездействия (30 мин).")
+                    except Exception:
+                        pass
+
+
 # ── Event handlers ──────────────────────────────────────────────────────────
 
 @bot.on("READY")
@@ -69,6 +107,7 @@ async def on_ready(data: dict):
     user = data.get("user", {})
     print(f"Бот запущен: {user.get('username')} (id={user.get('id')})")
     print("Команды: !play <запрос/ссылка> | !pause | !resume | !skip | !stop | !queue | !np")
+    asyncio.create_task(_idle_watcher())
 
 
 @bot.on("MESSAGE_CREATE")
@@ -88,6 +127,10 @@ async def on_message(data: dict):
     parts = content.split(maxsplit=1)
     cmd = parts[0].lower()
     arg = parts[1] if len(parts) > 1 else ""
+
+    # Обновляем время последней активности
+    _last_activity[guild_id] = time.monotonic()
+    _last_text_channel[guild_id] = channel_id
 
     # ── !play ──────────────────────────────────────────────────────────────
     if cmd == "!play":
