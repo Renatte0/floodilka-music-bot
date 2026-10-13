@@ -67,6 +67,29 @@ class Track:
     duration: int          # seconds
     requested_by: str
     http_headers: dict = field(default_factory=dict)
+    # Прямые ссылки Яндекса живут недолго, поэтому для них храним id и
+    # добываем ссылку перед самым воспроизведением, а не при постановке в очередь.
+    ym_track_id: str | None = None
+
+
+def _ym_direct_link(track_id: str) -> str:
+    client = _get_ym_client()
+    if client is None:
+        raise RuntimeError("Yandex Music недоступен (нет YANDEX_MUSIC_TOKEN)")
+    infos = client.tracks_download_info(track_id, get_direct_links=False)
+    if not infos:
+        raise RuntimeError("Нет доступных вариантов загрузки")
+    infos.sort(key=lambda x: x.bitrate_in_kbps or 0, reverse=True)
+    return infos[0].get_direct_link()
+
+
+async def resolve_stream_url(track: Track) -> str:
+    """Актуальный URL потока на момент воспроизведения."""
+    if not track.ym_track_id:
+        return track.stream_url
+    loop = asyncio.get_running_loop()
+    async with _search_sem:
+        return await loop.run_in_executor(_executor, _ym_direct_link, track.ym_track_id)
 
 
 async def resolve_track(query: str, requested_by: str) -> Track:
@@ -83,21 +106,15 @@ async def resolve_track(query: str, requested_by: str) -> Track:
             if not result or not result.tracks or not result.tracks.results:
                 return None
             t = result.tracks.results[0]
-            infos = t.get_download_info(get_direct_links=True)
-            if not infos:
-                return None
-            infos.sort(key=lambda x: x.bitrate_in_kbps or 0, reverse=True)
-            url = infos[0].direct_link
-            if not url:
-                return None
             artists = ", ".join(a.name for a in (t.artists or []))
             title = f"{artists} - {t.title}" if artists else (t.title or "Unknown")
             return Track(
                 title=title,
-                stream_url=url,
+                stream_url="",
                 webpage_url=f"https://music.yandex.ru/track/{t.id}",
                 duration=(t.duration_ms or 0) // 1000,
                 requested_by=requested_by,
+                ym_track_id=str(t.id),
             )
 
         try:
@@ -143,7 +160,7 @@ def _fmt_duration(seconds: int) -> str:
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
-def _build_ffmpeg_args(track: Track) -> list[str]:
+def _build_ffmpeg_args(track: Track, stream_url: str) -> list[str]:
     headers_str = ""
     for k, v in track.http_headers.items():
         headers_str += f"{k}: {v}\r\n"
@@ -154,7 +171,7 @@ def _build_ffmpeg_args(track: Track) -> list[str]:
     if headers_str:
         args += ["-headers", headers_str]
     args += [
-        "-i", track.stream_url,
+        "-i", stream_url,
         "-vn",
         "-f", "s16le",
         "-ar", str(SAMPLE_RATE),
@@ -349,9 +366,13 @@ class MusicPlayer:
 
     async def _open_stream(self, track: Track):
         loop = asyncio.get_running_loop()
+        stream_url = await resolve_stream_url(track)
+        if not stream_url:
+            raise RuntimeError(f"Нет потока для трека: {track.title}")
         async with _start_sem:
             proc = await asyncio.wait_for(
-                loop.run_in_executor(_executor, _spawn_ffmpeg, _build_ffmpeg_args(track)),
+                loop.run_in_executor(_executor, _spawn_ffmpeg,
+                                     _build_ffmpeg_args(track, stream_url)),
                 timeout=20.0,
             )
             reader = asyncio.StreamReader(limit=_PIPE_LIMIT)
