@@ -1,0 +1,31 @@
+[Unit]
+Description=Floodilka music bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=floodilka
+Group=floodilka
+WorkingDirectory=/opt/floodilka-bot
+ExecStart=/opt/floodilka-bot/.venv/bin/python main.py
+Environment=PYTHONUNBUFFERED=1
+
+Restart=always
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=floodilka-bot
+
+# каждый поток держит пайп FFmpeg и сокеты LiveKit
+LimitNOFILE=65535
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/floodilka-bot
+
+[Install]
+WantedBy=multi-user.target
