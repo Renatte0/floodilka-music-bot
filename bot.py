@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import ssl
 from typing import Callable, Awaitable, Any
 
@@ -13,14 +14,21 @@ from dotenv import load_dotenv
 _DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(_DIR, ".env"))
 
-_ssl_ctx = ssl.create_default_context(cafile=certifi.where())
-_ssl_ctx.check_hostname = False
-_ssl_ctx.verify_mode = ssl.CERT_NONE
-
 logger = logging.getLogger(__name__)
 
 BASE_URL = os.environ.get("FLOODILKA_API", "https://floodilka.com/api/v1")
 GATEWAY_URL = os.environ.get("FLOODILKA_GATEWAY", "wss://gateway.floodilka.com/?v=1&encoding=json")
+
+HTTP_CONCURRENCY = int(os.environ.get("HTTP_CONCURRENCY", "50"))
+HTTP_MAX_RETRIES = int(os.environ.get("HTTP_MAX_RETRIES", "3"))
+HTTP_TIMEOUT = float(os.environ.get("HTTP_TIMEOUT", "20"))
+MAX_RETRY_AFTER = 60.0
+
+_ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+if os.environ.get("FLOODILKA_SSL_VERIFY", "1") == "0":
+    _ssl_ctx.check_hostname = False
+    _ssl_ctx.verify_mode = ssl.CERT_NONE
+    logger.warning("TLS verification disabled (FLOODILKA_SSL_VERIFY=0)")
 
 OP_DISPATCH = 0
 OP_HEARTBEAT = 1
@@ -43,13 +51,19 @@ class FloodilkaBot:
         self.token = token
         self.intents = intents
         self._http: aiohttp.ClientSession | None = None
+        self._http_sem = asyncio.Semaphore(HTTP_CONCURRENCY)
         self._ws: Any = None
         self._heartbeat_interval: float = 41250
         self._sequence: int | None = None
         self._session_id: str | None = None
         self._resume_gateway_url: str | None = None
         self._heartbeat_task: asyncio.Task | None = None
+        self._ack_pending = False
+        self._ready_once = False
         self._handlers: dict[str, list[Handler]] = {}
+        # create_task returns a weak reference; without this the GC can kill
+        # a handler mid-flight under load.
+        self._tasks: set[asyncio.Task] = set()
 
         self._bot_id: str | None = None
         # {guild_id: {user_id: channel_id}}
@@ -65,25 +79,77 @@ class FloodilkaBot:
             return func
         return decorator
 
+    def spawn(self, coro) -> asyncio.Task:
+        task = asyncio.create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return task
+
     # ── HTTP ────────────────────────────────────────────────────────────────
 
     async def _session(self) -> aiohttp.ClientSession:
         if self._http is None or self._http.closed:
-            connector = aiohttp.TCPConnector(ssl=_ssl_ctx)
+            connector = aiohttp.TCPConnector(
+                ssl=_ssl_ctx,
+                limit=HTTP_CONCURRENCY * 4,
+                limit_per_host=HTTP_CONCURRENCY * 2,
+                ttl_dns_cache=300,
+                keepalive_timeout=60,
+            )
             self._http = aiohttp.ClientSession(
                 headers={"Authorization": f"Bot {self.token}"},
                 connector=connector,
+                timeout=aiohttp.ClientTimeout(total=HTTP_TIMEOUT),
             )
         return self._http
+
+    async def _retry_after(self, resp: aiohttp.ClientResponse) -> float:
+        header = resp.headers.get("Retry-After")
+        if header:
+            try:
+                return min(float(header), MAX_RETRY_AFTER)
+            except ValueError:
+                pass
+        try:
+            body = await resp.json()
+            if isinstance(body, dict) and "retry_after" in body:
+                return min(float(body["retry_after"]), MAX_RETRY_AFTER)
+        except Exception:
+            pass
+        return 1.0
 
     async def _request(self, method: str, endpoint: str, **kwargs) -> Any:
         session = await self._session()
         url = f"{BASE_URL}{endpoint}"
-        async with session.request(method, url, **kwargs) as resp:
-            resp.raise_for_status()
-            if resp.content_type == "application/json":
-                return await resp.json()
-            return await resp.text()
+
+        for attempt in range(HTTP_MAX_RETRIES + 1):
+            backoff = min(2 ** attempt, 10) + random.uniform(0, 0.5)
+            try:
+                async with self._http_sem:
+                    async with session.request(method, url, **kwargs) as resp:
+                        if resp.status == 429 and attempt < HTTP_MAX_RETRIES:
+                            delay = await self._retry_after(resp)
+                            logger.warning("Rate limited on %s %s, retry in %.2fs",
+                                           method, endpoint, delay)
+                            await asyncio.sleep(delay)
+                            continue
+                        if resp.status >= 500 and attempt < HTTP_MAX_RETRIES:
+                            logger.warning("HTTP %s on %s %s, retry in %.2fs",
+                                           resp.status, method, endpoint, backoff)
+                            await asyncio.sleep(backoff)
+                            continue
+                        resp.raise_for_status()
+                        if resp.content_type == "application/json":
+                            return await resp.json()
+                        return await resp.text()
+            except (aiohttp.ClientConnectionError, asyncio.TimeoutError):
+                if attempt >= HTTP_MAX_RETRIES:
+                    raise
+                logger.warning("Network error on %s %s, retry in %.2fs",
+                               method, endpoint, backoff)
+                await asyncio.sleep(backoff)
+
+        raise RuntimeError(f"Request failed after retries: {method} {endpoint}")
 
     # ── REST ────────────────────────────────────────────────────────────────
 
@@ -119,23 +185,25 @@ class FloodilkaBot:
     def get_user_voice_channel(self, guild_id: str, user_id: str) -> str | None:
         return self._voice_states.get(guild_id, {}).get(user_id)
 
-    async def join_voice(self, guild_id: str, channel_id: str) -> dict:
+    async def join_voice(self, guild_id: str, channel_id: str, timeout: float = 15.0) -> dict:
         """Send op=4 to join a voice channel and wait for VOICE_SERVER_UPDATE.
 
         Returns the VOICE_SERVER_UPDATE payload (contains LiveKit URL + token).
         """
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         future: asyncio.Future = loop.create_future()
         self._voice_server_futures[guild_id] = future
 
-        await self._send(OP_VOICE_STATE_UPDATE, {
-            "guild_id": guild_id,
-            "channel_id": channel_id,
-            "self_mute": False,
-            "self_deaf": False,
-        })
-
-        return await asyncio.wait_for(future, timeout=10.0)
+        try:
+            await self._send(OP_VOICE_STATE_UPDATE, {
+                "guild_id": guild_id,
+                "channel_id": channel_id,
+                "self_mute": False,
+                "self_deaf": False,
+            })
+            return await asyncio.wait_for(future, timeout=timeout)
+        finally:
+            self._voice_server_futures.pop(guild_id, None)
 
     async def leave_voice(self, guild_id: str) -> None:
         await self._send(OP_VOICE_STATE_UPDATE, {
@@ -148,7 +216,10 @@ class FloodilkaBot:
     # ── Gateway send ────────────────────────────────────────────────────────
 
     async def _send(self, op: int, data: Any) -> None:
-        await self._ws.send(json.dumps({"op": op, "d": data}))
+        ws = self._ws
+        if ws is None:
+            raise ConnectionError("Gateway is not connected")
+        await ws.send(json.dumps({"op": op, "d": data}))
 
     async def _identify(self) -> None:
         await self._send(OP_IDENTIFY, {
@@ -164,13 +235,22 @@ class FloodilkaBot:
         })
 
     async def _heartbeat_loop(self) -> None:
+        interval = self._heartbeat_interval / 1000
         try:
+            await asyncio.sleep(interval * random.random())
             while True:
-                await asyncio.sleep(self._heartbeat_interval / 1000)
+                self._ack_pending = True
                 await self._send(OP_HEARTBEAT, self._sequence)
-                logger.debug("Heartbeat sent (seq=%s)", self._sequence)
+                await asyncio.sleep(interval)
+                if self._ack_pending:
+                    logger.warning("No heartbeat ACK — connection is a zombie, reconnecting")
+                    if self._ws is not None:
+                        await self._ws.close(4000)
+                    return
         except asyncio.CancelledError:
             pass
+        except Exception:
+            logger.exception("Heartbeat loop died")
 
     # ── Event dispatch ──────────────────────────────────────────────────────
 
@@ -181,7 +261,7 @@ class FloodilkaBot:
                     await h(d)
                 except Exception:
                     logger.exception("Error in handler for %s", e)
-            asyncio.create_task(_run())
+            self.spawn(_run())
 
     async def _handle(self, raw: str) -> None:
         msg = json.loads(raw)
@@ -197,6 +277,7 @@ class FloodilkaBot:
             self._heartbeat_interval = data["heartbeat_interval"]
             if self._heartbeat_task:
                 self._heartbeat_task.cancel()
+            self._ack_pending = False
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
             if self._session_id and self._resume_gateway_url:
                 await self._resume()
@@ -204,7 +285,7 @@ class FloodilkaBot:
                 await self._identify()
 
         elif op == OP_HEARTBEAT_ACK:
-            logger.debug("Heartbeat ACK")
+            self._ack_pending = False
 
         elif op == OP_HEARTBEAT:
             await self._send(OP_HEARTBEAT, self._sequence)
@@ -220,7 +301,7 @@ class FloodilkaBot:
                 self._session_id = None
                 self._resume_gateway_url = None
                 self._sequence = None
-            await asyncio.sleep(2)
+            await asyncio.sleep(1 + random.random() * 4)
             await self._identify()
 
         elif op == OP_DISPATCH and event:
@@ -229,7 +310,12 @@ class FloodilkaBot:
                 self._resume_gateway_url = data.get("resume_gateway_url")
                 user = data.get("user", {})
                 self._bot_id = user.get("id")
+                self._ready_once = True
                 logger.info("Bot ready: %s (id=%s)", user.get("username"), self._bot_id)
+
+            elif event == "RESUMED":
+                self._ready_once = True
+                logger.info("Session resumed")
 
             elif event == "GUILD_CREATE":
                 guild_id = data.get("id")
@@ -241,6 +327,9 @@ class FloodilkaBot:
                         if uid and cid:
                             guild_states[uid] = cid
 
+            elif event == "GUILD_DELETE":
+                self._voice_states.pop(data.get("id"), None)
+
             elif event == "VOICE_STATE_UPDATE":
                 guild_id = data.get("guild_id")
                 user_id = data.get("user_id")
@@ -251,10 +340,13 @@ class FloodilkaBot:
                         guild_states[user_id] = channel_id
                     else:
                         guild_states.pop(user_id, None)
+                        if not guild_states:
+                            self._voice_states.pop(guild_id, None)
 
             elif event == "VOICE_SERVER_UPDATE":
                 guild_id = data.get("guild_id")
-                logger.info("VOICE_SERVER_UPDATE: %s", data)
+                logger.info("VOICE_SERVER_UPDATE guild=%s endpoint=%s",
+                            guild_id, data.get("endpoint") or data.get("url"))
                 future = self._voice_server_futures.pop(guild_id, None)
                 if future and not future.done():
                     future.set_result(data)
@@ -269,26 +361,49 @@ class FloodilkaBot:
 
     async def _connect(self) -> None:
         url = self._resume_gateway_url or GATEWAY_URL
-        async with websockets.connect(url, ssl=_ssl_ctx) as ws:
+        # App-level heartbeats already detect dead links; WS pings would only
+        # add false positives if the gateway does not answer them.
+        async with websockets.connect(
+            url,
+            ssl=_ssl_ctx,
+            ping_interval=None,
+            open_timeout=30,
+            close_timeout=10,
+            max_size=16 * 1024 * 1024,
+            max_queue=1024,
+        ) as ws:
             self._ws = ws
-            async for message in ws:
-                await self._handle(message)
+            try:
+                async for message in ws:
+                    await self._handle(message)
+            finally:
+                self._ws = None
 
     async def run(self) -> None:
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(asctime)s [%(levelname)s] %(message)s",
-        )
+        backoff = 1.0
         while True:
+            self._ready_once = False
             try:
                 await self._connect()
-                logger.info("Connection closed, reconnecting in 5s...")
+                logger.info("Connection closed, reconnecting...")
             except Exception:
-                logger.exception("Connection error, reconnecting in 5s...")
+                logger.exception("Connection error, reconnecting...")
             finally:
                 if self._heartbeat_task:
                     self._heartbeat_task.cancel()
-            await asyncio.sleep(5)
+                    self._heartbeat_task = None
+                for fut in self._voice_server_futures.values():
+                    if not fut.done():
+                        fut.cancel()
+                self._voice_server_futures.clear()
+            # Only a session that actually reached READY counts as healthy —
+            # otherwise a rejected token would reconnect in a tight loop.
+            backoff = 1.0 if self._ready_once else min(backoff * 2, 60.0)
+            await asyncio.sleep(backoff + random.uniform(0, 1))
 
     def start(self) -> None:
+        logging.basicConfig(
+            level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+            format="%(asctime)s [%(levelname)s] %(message)s",
+        )
         asyncio.run(self.run())
