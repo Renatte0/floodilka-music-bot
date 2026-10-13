@@ -1,10 +1,13 @@
 import asyncio
+import ipaddress
 import logging
 import os
+import socket
 import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from urllib.parse import urlparse
 
 import yt_dlp
 from livekit import rtc
@@ -57,6 +60,30 @@ def _get_ym_client():
 
 class QueueFull(RuntimeError):
     pass
+
+
+class UnsafeURL(RuntimeError):
+    pass
+
+
+def _assert_public_url(url: str) -> None:
+    """Публичный бот принимает ссылки от кого угодно, поэтому без этой проверки
+    им можно простукивать внутреннюю сеть сервера и метаданные облака."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise UnsafeURL("Поддерживаются только ссылки http/https.")
+    host = parsed.hostname
+    if not host:
+        raise UnsafeURL("Некорректная ссылка.")
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        raise UnsafeURL("Не удалось разрешить адрес.") from None
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
+                or ip.is_multicast or ip.is_unspecified):
+            raise UnsafeURL("Такие адреса запрещены.")
 
 
 @dataclass
@@ -143,6 +170,7 @@ async def resolve_track(query: str, requested_by: str) -> Track:
             return info
 
     async with _search_sem:
+        await loop.run_in_executor(_executor, _assert_public_url, query)
         info = await loop.run_in_executor(_executor, _extract)
     return Track(
         title=info.get("title", "Unknown"),

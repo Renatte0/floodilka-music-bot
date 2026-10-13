@@ -19,6 +19,10 @@ if not TOKEN:
 
 bot = FloodilkaBot(TOKEN)
 
+
+class AtCapacity(RuntimeError):
+    pass
+
 IDLE_TIMEOUT = int(os.environ.get("IDLE_TIMEOUT", 30 * 60))
 MAX_VOICE_SESSIONS = int(os.environ.get("MAX_VOICE_SESSIONS", "50"))
 USER_RATE_LIMIT = int(os.environ.get("USER_RATE_LIMIT", "5"))
@@ -66,7 +70,9 @@ async def get_or_create_player(guild_id: str, channel_id: str) -> MusicPlayer | 
 
     if len(_players) >= MAX_VOICE_SESSIONS:
         logger.warning("Voice session cap reached (%s)", MAX_VOICE_SESSIONS)
-        return None
+        raise AtCapacity(
+            "Бот сейчас занят на всех доступных каналах. Попробуй через несколько минут."
+        )
 
     try:
         voice_data = await bot.join_voice(guild_id, channel_id)
@@ -222,13 +228,24 @@ async def on_message(data: dict):
 
         try:
             track = await resolve_track(arg, requested_by=author.get("username", "?"))
-        except Exception as e:
-            await bot.edit_message(channel_id, searching_msg["id"], f"Ошибка поиска: {e}")
+        except RuntimeError as e:
+            # наши собственные сообщения (не найдено / небезопасная ссылка) показывать можно
+            await bot.edit_message(channel_id, searching_msg["id"], str(e))
+            return
+        except Exception:
+            # текст чужих исключений светит внутренние пути и адреса, а канал публичный
+            logger.exception("Ошибка поиска по запросу от user=%s", user_id)
+            await bot.edit_message(channel_id, searching_msg["id"],
+                                   "Не удалось обработать запрос.")
             return
 
         # Без блокировки два одновременных !play подняли бы две LiveKit-сессии
         async with _guild_lock(guild_id):
-            player = await get_or_create_player(guild_id, voice_channel)
+            try:
+                player = await get_or_create_player(guild_id, voice_channel)
+            except AtCapacity as e:
+                await bot.edit_message(channel_id, searching_msg["id"], str(e))
+                return
             if not player:
                 await bot.edit_message(channel_id, searching_msg["id"],
                                        "Не удалось подключиться к голосовому каналу.")
